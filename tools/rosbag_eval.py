@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-# -*- coding:utf-8 -*-
+
 
 import argparse
+from cmath import isnan
+import copy
 import os
 import csv
 import time
+
 from loguru import logger
 
 import cv2
@@ -12,6 +15,10 @@ import numpy as np
 
 import torch
 import tqdm
+
+
+from geometry_msgs.msg import PoseArray, Pose
+import rospy
 
 from yolox.data.data_augment import ValTransform
 from yolox.exp import get_exp
@@ -408,14 +415,15 @@ class ProcessRosBag:
                 #Subscriber('/door_handle', PointStamped),
                 Subscriber('/realsense_back/color/camera_info', CameraInfo),
             ],
-            queue_size=500,
+            queue_size=50,
         )
         self.synchronizer.registerCallback(self.rosbag_process)
         self.publisher = rospy.Publisher(
             '/3d_handle_coordinates',
             PointStamped,
-            queue_size=500,
+            queue_size=10,
         )
+        self.pointArrayPub = rospy.Publisher("/handle/points_yolo", PoseArray, queue_size=1)
         
         self.bridge = CvBridge()
         self.count = 0
@@ -428,11 +436,10 @@ class ProcessRosBag:
     ):
         depth = depth / 1000
         fx, _, cx, _, fy, cy, _, _, _ = camera_info
-        
         height, width = depth.shape
         
         for i in range(len(keypoints_coordinates)):
-            two_near_center_pixels = keypoints_coordinates[i]['keypoints'][[3, 4], :2]
+            two_near_center_pixels = keypoints_coordinates[i]['keypoints'][[2, 3], :2]
             keypoints_coordinates[i]['middle_keypoint'] = np.mean(two_near_center_pixels, axis=0)
             two_near_center_image = []
             
@@ -467,20 +474,114 @@ class ProcessRosBag:
                         
                         mean_approx_by_deltas.append(depth[new_y, new_x])
                         
-                z = np.mean(mean_approx_by_deltas)
+                z = np.mean(mean_approx_by_deltas) + 0.02
                 
                 two_near_center_image.append(
                     [
                         z * (base_x - cx) / fx,
-                        z * (base_y - cy) / fy,
+                        z * (base_y + 100 - cy) / fy,
                         z,
                     ]
                 )
             
             middle_point = np.mean(two_near_center_image, axis=0)
-            
             if check_flag:
                 keypoints_coordinates[i]['keypoints_3d'] = middle_point
+
+                def meanZ(x, y, depth):
+                    return np.mean(np.array([ 
+                                    depth[int(dy + y) ][int(dx + x)] 
+                                    for dx, dy in zip( (1, 1, -1, -1), (1, -1, 1, -1) )   ]))
+                def project(x, y, z):
+                    return np.array([
+                        z*(x - cx) / fx,
+                        z*(y - cy) / fy,
+                        z
+                    ])
+                
+                def keypointToPose(point, z):
+                    pose = Pose()
+                    pose.position.z = z
+                    pose.position.x = pose.position.z * (point[0] - cx) / fx
+                    pose.position.y = pose.position.z * (point[1] - cy) / fy
+                    return pose
+
+                
+                handlePointsArray = PoseArray()
+                basePoint1 = keypoints_coordinates[i]['keypoints'][2]
+                basePoint2 = keypoints_coordinates[i]['keypoints'][3]
+                try:
+                    p0 = project(
+                        basePoint1[0],
+                        basePoint1[1] + 50,
+                        meanZ(basePoint1[0], basePoint1[1] +  50, depth)
+                    )
+                    p1 = project(
+                        basePoint1[0] + 10,
+                        basePoint1[1] + 50,
+                        meanZ(basePoint1[0] + 10, basePoint1[1] + 50, depth)
+                    )
+                    p2 = project(
+                        basePoint1[0],
+                        basePoint1[1] + 60,
+                        meanZ(basePoint1[0], basePoint1[1] + 60, depth)
+                    )
+                    normal = np.cross(
+                        p2 - p0,
+                        p1 - p0
+                    )
+                    import math
+                    if math.isnan( np.linalg.norm(normal)) or math.isinf(np.linalg.norm(normal)):
+                        continue 
+                    normal /= np.linalg.norm(normal)
+                except:
+                    continue
+                handlePointsArray.poses.append(
+                    keypointToPose(
+                        basePoint1, 
+                        meanZ(basePoint1[0], basePoint1[1], depth)
+                        )
+                )
+                handlePointsArray.poses.append(
+                    keypointToPose(
+                        basePoint1, 
+                        meanZ(basePoint1[0], basePoint1[1], depth)
+                        )
+                )
+                handlePointsArray.poses.append(
+                    keypointToPose(
+                        basePoint2, 
+                        meanZ(basePoint2[0], basePoint2[1], depth)
+                        )
+                )
+                handlePointsArray.poses.append(
+                    keypointToPose(
+                        basePoint2, 
+                        meanZ(basePoint2[0], basePoint2[1], depth)
+                        )
+                )
+                handlePointsArray.poses[ 0].position.x += 0.04*normal[0]
+                handlePointsArray.poses[ 0].position.y += 0.04*normal[1]
+                handlePointsArray.poses[ 0].position.z += 0.04*normal[2]
+                handlePointsArray.poses[-1].position.x += 0.04*normal[0]
+                handlePointsArray.poses[-1].position.y += 0.04*normal[1]
+                handlePointsArray.poses[-1].position.z += 0.04*normal[2]
+                # for j, point in zip(range(len(keypoints_coordinates[i]['keypoints'])),  keypoints_coordinates[i]['keypoints']):
+                #     pose = keypointToPose(point, meanZ(point[0], point[1], depth))
+                    # pose = Pose()
+                    # pose.position.z = meanZ(point[0], point[1], depth)
+                    
+                    # #хреновый костыль
+                    # if j == 0 or j == len(keypoints_coordinates[i]['keypoints']) -1:
+                    #     pose.position.z += 0.04
+                    # #костыль закончен
+                    
+                    # pose.position.x = pose.position.z * (point[0] - cx) / fx
+                    # pose.position.y = pose.position.z * (point[1] - cy) / fy
+                    # handlePointsArray.poses.append(pose)
+                handlePointsArray.header.frame_id = "rs_camera"
+                handlePointsArray.header.stamp = rospy.get_rostime()
+                self.pointArrayPub.publish(handlePointsArray)
             else:
                 keypoints_coordinates[i]['keypoints_3d'] = None
             
@@ -499,15 +600,17 @@ class ProcessRosBag:
         
         outputs, img_info = self.predictor.inference(cv_img)
         result_det = self.predictor.visual(outputs[0], img_info, self.predictor.confthre)
-        pose_results, returned_outputs = inference_top_down_pose_model(
-            self.regressor,
-            img_info['raw_img'],
-            result_det,
-            bbox_thr=0.0,
-            format='xyxy',
-            dataset='TopDownCocoDataset',
-        )
-        
+        try:
+            pose_results, returned_outputs = inference_top_down_pose_model(
+                self.regressor,
+                img_info['raw_img'],
+                result_det,
+                bbox_thr=0.0,
+                format='xyxy',
+                dataset='TopDownCocoDataset',
+            )
+        except:
+            return
         result_image = vis_pose_result(
             self.regressor,
             img_info['raw_img'],
@@ -522,23 +625,23 @@ class ProcessRosBag:
             camera_info=camera_info_msg.K,
         )
         
-        if self.save_result:
+        # if self.save_result:
             
-            os.makedirs(os.path.join(self.save_folder, 'images'), exist_ok=True)
-            save_file_name = os.path.join(self.save_folder, 'images', f'{self.count}_image.png')
-            cv2.imwrite(save_file_name, result_image)
-            os.makedirs(os.path.join(self.save_folder, 'depths'), exist_ok=True)
-            save_file_name = os.path.join(self.save_folder, 'depths', f'{self.count}_depth.jpg')
-            plt.imsave(save_file_name, cv_depth)
-            os.makedirs(os.path.join(self.save_folder, 'coordinates'), exist_ok=True)
-            save_file_name = os.path.join(self.save_folder, 'coordinates', f'{self.count}_coord.csv')
+        #     os.makedirs(os.path.join(self.save_folder, 'images'), exist_ok=True)
+        #     save_file_name = os.path.join(self.save_folder, 'images', f'{self.count}_image.png')
+        #     cv2.imwrite(save_file_name, result_image)
+        #     os.makedirs(os.path.join(self.save_folder, 'depths'), exist_ok=True)
+        #     save_file_name = os.path.join(self.save_folder, 'depths', f'{self.count}_depth.jpg')
+        #     plt.imsave(save_file_name, cv_depth)
+        #     os.makedirs(os.path.join(self.save_folder, 'coordinates'), exist_ok=True)
+        #     save_file_name = os.path.join(self.save_folder, 'coordinates', f'{self.count}_coord.csv')
             
-            keys = pose_results[0].keys()
+        #     keys = pose_results[0].keys()
             
-            with open(save_file_name, 'w', newline='') as output_file:
-                dict_writer = csv.DictWriter(output_file, keys)
-                dict_writer.writeheader()
-                dict_writer.writerows(pose_results)
+        #     with open(save_file_name, 'w', newline='') as output_file:
+        #         dict_writer = csv.DictWriter(output_file, keys)
+        #         dict_writer.writeheader()
+        #         dict_writer.writerows(pose_results)
         
         self.count += 1
         
