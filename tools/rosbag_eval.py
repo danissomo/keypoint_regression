@@ -397,7 +397,7 @@ class ProcessRosBag:
             TimeSynchronizer,
         )
         from sensor_msgs.msg import (
-            Image,
+            CompressedImage,
             CameraInfo,
         )
         from cv_bridge import CvBridge
@@ -410,8 +410,8 @@ class ProcessRosBag:
         
         self.synchronizer = TimeSynchronizer(
             [
-                Subscriber('/realsense_back/color/image_raw', Image),
-                Subscriber('/realsense_back/aligned_depth_to_color/image_raw', Image),
+                Subscriber('/realsense_back/color/image_raw/compressed', CompressedImage),
+                Subscriber('/realsense_back/aligned_depth_to_color/image_raw/compressed', CompressedImage),
                 #Subscriber('/door_handle', PointStamped),
                 Subscriber('/realsense_back/color/camera_info', CameraInfo),
             ],
@@ -592,11 +592,16 @@ class ProcessRosBag:
         #point,
         camera_info_msg,
     ):
-        cv_img = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="passthrough")
-        cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
+
+
+        np_depth_arr = np.fromstring(depth_msg.data, np.uint8)
+        cv_depth = cv2.imdecode(np_depth_arr, cv2.IMREAD_GRAYSCALE)
+        np_img_arr = np.fromstring(image_msg.data, np.uint8)
+        cv_img = cv2.imdecode(np_img_arr, cv2.IMREAD_COLOR)
+        # cv_img = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="passthrough")
+        # cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
         #gt_projected_point = self.listner.transformPoint("rs_camera", point)
-        
-        assert cv_img.shape[:2] == cv_depth.shape, 'Shapes of depth and image should be the same'
+        assert cv_img.shape[:2] == cv_depth.shape, f'Shapes of depth and image should be the same{cv_img.shape[:2]}, {cv_depth.shape}'
         
         outputs, img_info = self.predictor.inference(cv_img)
         result_det = self.predictor.visual(outputs[0], img_info, self.predictor.confthre)
